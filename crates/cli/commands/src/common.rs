@@ -221,6 +221,40 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
 
             let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
 
+            // Apply RETH_UNWIND_CHUNK_SIZE to bound the per-iteration memory of the consistency-
+            // check unwind. The default ExecutionConfig::max_blocks is 500_000, which is larger
+            // than typical divergences (~10K-200K blocks) so the unwind effectively runs as a
+            // single transaction and materializes the full BundleState in memory (32-64 GiB OOM
+            // on multi-100K-block divergences). When set, this env var clamps the per-stage
+            // commit cadence so the pipeline flushes intermediate progress to disk.
+            let mut stages_config = config.stages.clone();
+            if let Ok(raw) = std::env::var("RETH_UNWIND_CHUNK_SIZE")
+                && let Ok(chunk) = raw.parse::<u64>()
+                && chunk > 0
+            {
+                info!(
+                    target: "reth::cli",
+                    chunk_size = chunk,
+                    "RETH_UNWIND_CHUNK_SIZE set — capping consistency-check unwind per-iteration ranges"
+                );
+                stages_config.execution.max_blocks = Some(chunk);
+                if stages_config.index_account_history.commit_threshold > chunk {
+                    stages_config.index_account_history.commit_threshold = chunk;
+                }
+                if stages_config.index_storage_history.commit_threshold > chunk {
+                    stages_config.index_storage_history.commit_threshold = chunk;
+                }
+                if stages_config.account_hashing.commit_threshold > chunk {
+                    stages_config.account_hashing.commit_threshold = chunk;
+                }
+                if stages_config.storage_hashing.commit_threshold > chunk {
+                    stages_config.storage_hashing.commit_threshold = chunk;
+                }
+                if stages_config.transaction_lookup.chunk_size > chunk {
+                    stages_config.transaction_lookup.chunk_size = chunk;
+                }
+            }
+
             // Builds and executes an unwind-only pipeline
             let mut pipeline = Pipeline::<NodeTypesWithDBAdapter<N, DatabaseEnv>>::builder()
                 .add_stages(DefaultStages::new(
@@ -230,7 +264,7 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
                     NoopHeaderDownloader::default(),
                     NoopBodiesDownloader::default(),
                     NoopEvmConfig::<N::Evm>::default(),
-                    config.stages.clone(),
+                    stages_config,
                     config.prune.segments.clone(),
                     None,
                 ))
