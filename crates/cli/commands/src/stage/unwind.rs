@@ -39,6 +39,19 @@ pub struct Command<C: ChainSpecParser> {
     /// unwound.
     #[arg(long)]
     offline: bool,
+
+    /// Maximum number of blocks unwound per Execution-stage iteration before committing the MDBX
+    /// write transaction.
+    ///
+    /// When set, caps `ExecutionStageThresholds::max_blocks` and the IndexHistory / Hashing
+    /// `commit_threshold`s used in the unwind pipeline so each stage flushes intermediate
+    /// progress rather than buffering the entire unwind range as one `BundleState` in memory.
+    /// Useful when unwinding very large ranges (>50k blocks) where the default (unbounded) path
+    /// OOMs on 32-64 GiB hosts.
+    ///
+    /// If unset, retains historical behavior of one transaction per stage (unbounded memory).
+    #[arg(long, env = "RETH_UNWIND_CHUNK_SIZE")]
+    unwind_chunk_size: Option<u64>,
 }
 
 impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C> {
@@ -70,6 +83,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
         let mut pipeline =
             self.build_pipeline(config, provider_factory, components.evm_config().clone())?;
 
+
         // Move all applicable data from database to static files.
         pipeline.move_to_static_files()?;
 
@@ -82,10 +96,40 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
 
     fn build_pipeline<N: ProviderNodeTypes<ChainSpec = C::ChainSpec>>(
         self,
-        config: Config,
+        mut config: Config,
         provider_factory: ProviderFactory<N>,
         evm_config: impl ConfigureEvm<Primitives = N::Primitives> + 'static,
     ) -> Result<Pipeline<N>, eyre::Error> {
+        // Apply --unwind-chunk-size to every stage that already supports a per-iteration cap.
+        // This forces the pipeline loop at `Pipeline::unwind` (which commits the MDBX write tx
+        // after each stage iteration) to flush progress to disk every `chunk` blocks instead of
+        // buffering the entire unwind range as one `BundleState` in memory.
+        if let Some(chunk) = self.unwind_chunk_size {
+            info!(
+                target: "reth::cli",
+                chunk_size = chunk,
+                "Capping per-iteration unwind range to bound peak memory"
+            );
+            config.stages.execution.max_blocks = Some(chunk);
+            // IndexHistory / Hashing default to 100_000 — clamp to the requested chunk so the
+            // unwind loop commits at the same cadence as Execution.
+            if config.stages.index_account_history.commit_threshold > chunk {
+                config.stages.index_account_history.commit_threshold = chunk;
+            }
+            if config.stages.index_storage_history.commit_threshold > chunk {
+                config.stages.index_storage_history.commit_threshold = chunk;
+            }
+            if config.stages.account_hashing.commit_threshold > chunk {
+                config.stages.account_hashing.commit_threshold = chunk;
+            }
+            if config.stages.storage_hashing.commit_threshold > chunk {
+                config.stages.storage_hashing.commit_threshold = chunk;
+            }
+            if config.stages.transaction_lookup.chunk_size > chunk {
+                config.stages.transaction_lookup.chunk_size = chunk;
+            }
+        }
+
         let stage_conf = &config.stages;
         let prune_modes = config.prune.segments.clone();
 
@@ -119,7 +163,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
                     evm_config,
                     Arc::new(NoopConsensus::default()),
                     ExecutionStageThresholds {
-                        max_blocks: None,
+                        max_blocks: self.unwind_chunk_size,
                         max_changes: None,
                         max_cumulative_gas: None,
                         max_duration: None,
